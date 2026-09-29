@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Golf Cart Link</title>
+<style>
+  :root {
+    --bg: #f4f6f3; --card: #ffffff; --text: #1c2420; --muted: #5d6b63;
+    --accent: #1f7a4d; --accent-text: #ffffff; --warn: #b3261e; --border: #d9e0db;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111613; --card: #1b221e; --text: #e6ece8; --muted: #9aa8a0;
+      --accent: #3fae78; --accent-text: #08130d; --warn: #f28b82; --border: #2c3630;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  main { max-width: 480px; margin: 0 auto; display: grid; gap: 12px; }
+  h1 { font-size: 22px; margin: 4px 0; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
+  .label { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: .04em; }
+  .value { font-size: 18px; font-variant-numeric: tabular-nums; word-break: break-word; }
+  .big { font-size: 28px; font-weight: 600; }
+  button {
+    width: 100%; padding: 16px; border: 0; border-radius: 12px; font-size: 18px; font-weight: 600;
+    background: var(--accent); color: var(--accent-text);
+  }
+  button.stop { background: var(--warn); }
+  .err { color: var(--warn); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Golf Cart Link</h1>
+  <button id="btn">Connect to cart</button>
+
+  <div class="card">
+    <div class="label">Bluetooth</div>
+    <div class="value" id="ble">Not connected</div>
+  </div>
+
+  <div class="card">
+    <div class="label">Cart says</div>
+    <div class="value big" id="cart">--</div>
+  </div>
+
+  <div class="card">
+    <div class="label">My location (sent to cart)</div>
+    <div class="value" id="loc">--</div>
+    <div class="label" style="margin-top:8px">Sent</div>
+    <div class="value" id="sent">0</div>
+  </div>
+
+  <div class="card">
+    <div class="value" id="msg">Keep this page open with the screen on. iOS stops location updates when the app is in the background or the screen locks.</div>
+  </div>
+</main>
+
+<script>
+const SERVICE   = "c0de0001-6a7e-4c6f-9f1e-7c8a1b2d3e4f";
+const PHONE_LOC = "c0de0002-6a7e-4c6f-9f1e-7c8a1b2d3e4f";
+const STATUS    = "c0de0003-6a7e-4c6f-9f1e-7c8a1b2d3e4f";
+const SEND_INTERVAL_MS = 500;
+
+const $ = id => document.getElementById(id);
+let device = null, locChar = null, watchId = null, wakeLock = null;
+let latest = null, sendTimer = null, sending = false, sentCount = 0;
+
+function showError(text) {
+  $("msg").textContent = text;
+  $("msg").className = "value err";
+}
+
+$("btn").onclick = () => (device && device.gatt.connected) ? disconnect() : connect();
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    showError("This browser has no Bluetooth support. On iPhone, open this page in the Bluefy app.");
+    return;
+  }
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ name: "GolfCart" }],
+      optionalServices: [SERVICE],
+    });
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+    $("ble").textContent = "Connecting...";
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE);
+    locChar = await service.getCharacteristic(PHONE_LOC);
+    const statusChar = await service.getCharacteristic(STATUS);
+    statusChar.addEventListener("characteristicvaluechanged", e => {
+      $("cart").textContent = new TextDecoder().decode(e.target.value);
+    });
+    await statusChar.startNotifications();
+
+    $("ble").textContent = "Connected to " + device.name;
+    $("btn").textContent = "Disconnect";
+    $("btn").className = "stop";
+    startLocation();
+    keepAwake();
+  } catch (err) {
+    $("ble").textContent = "Not connected";
+    showError("Connect failed: " + err.message);
+  }
+}
+
+function disconnect() {
+  if (device && device.gatt.connected) device.gatt.disconnect();
+}
+
+function onDisconnected() {
+  $("ble").textContent = "Disconnected";
+  $("btn").textContent = "Connect to cart";
+  $("btn").className = "";
+  locChar = null;
+  if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+  watchId = null;
+  clearInterval(sendTimer);
+  if (wakeLock) wakeLock.release().catch(() => {});
+  wakeLock = null;
+}
+
+function startLocation() {
+  if (!navigator.geolocation) {
+    showError("Location is not available in this browser.");
+    return;
+  }
+  watchId = navigator.geolocation.watchPosition(
+    pos => {
+      latest = pos.coords;
+      $("loc").textContent =
+        `${latest.latitude.toFixed(6)}, ${latest.longitude.toFixed(6)}  ±${latest.accuracy.toFixed(1)} m`;
+    },
+    err => showError("Location error: " + err.message + ". Allow location access for Bluefy in iOS Settings."),
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
+  );
+  // Send on a fixed schedule so the cart keeps getting fresh timestamps even when standing still
+  sendTimer = setInterval(sendLatest, SEND_INTERVAL_MS);
+}
+
+async function sendLatest() {
+  if (!latest || !locChar || sending) return;
+  sending = true;
+  const msg = `${latest.latitude.toFixed(7)},${latest.longitude.toFixed(7)},${latest.accuracy.toFixed(1)}`;
+  try {
+    await locChar.writeValue(new TextEncoder().encode(msg));
+    $("sent").textContent = ++sentCount;
+  } catch (err) {
+    showError("Send failed: " + err.message);
+  } finally {
+    sending = false;
+  }
+}
+
+async function keepAwake() {
+  try {
+    if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen");
+  } catch (_) { /* not supported; user must keep the screen on */ }
+}
+</script>
+</body>
+</html>
