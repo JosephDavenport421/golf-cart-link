@@ -32,6 +32,11 @@
   }
   button.stop { background: var(--warn); }
   .err { color: var(--warn); }
+  .modes { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+  .modes button { padding: 22px 8px; font-size: 20px; background: var(--border); color: var(--text); }
+  .modes button:disabled { opacity: .45; }
+  .modes button.on-follow { background: var(--accent); color: var(--accent-text); }
+  .modes button.on-idle { background: var(--warn); color: #fff; }
 </style>
 </head>
 <body>
@@ -42,6 +47,15 @@
   <div class="card">
     <div class="label">Bluetooth</div>
     <div class="value" id="ble">Not connected</div>
+  </div>
+
+  <div class="card">
+    <div class="label">Mode</div>
+    <div class="value big" id="mode">--</div>
+    <div class="modes">
+      <button id="follow" disabled>Follow</button>
+      <button id="idle" disabled>Idle</button>
+    </div>
   </div>
 
   <div class="card">
@@ -65,18 +79,51 @@
 const SERVICE   = "c0de0001-6a7e-4c6f-9f1e-7c8a1b2d3e4f";
 const PHONE_LOC = "c0de0002-6a7e-4c6f-9f1e-7c8a1b2d3e4f";
 const STATUS    = "c0de0003-6a7e-4c6f-9f1e-7c8a1b2d3e4f";
+const MODE      = "c0de0004-6a7e-4c6f-9f1e-7c8a1b2d3e4f";
 const SEND_INTERVAL_MS = 500;
 
 const $ = id => document.getElementById(id);
-let device = null, locChar = null, watchId = null, wakeLock = null;
+let device = null, locChar = null, modeChar = null, watchId = null, wakeLock = null;
 let latest = null, sendTimer = null, sending = false, sentCount = 0;
+
+// Web Bluetooth allows one GATT operation at a time, so every write goes through this queue
+let gattQueue = Promise.resolve();
+function queueWrite(char, text) {
+  const job = gattQueue.then(() => char.writeValue(new TextEncoder().encode(text)));
+  gattQueue = job.catch(() => {});
+  return job;
+}
 
 function showError(text) {
   $("msg").textContent = text;
   $("msg").className = "value err";
 }
 
+// Show the mode the cart reports (its status text starts with FOLLOW or IDLE)
+function showMode(mode) {
+  $("mode").textContent = mode === "follow" ? "Following" : mode === "idle" ? "Idle" : "--";
+  $("follow").className = mode === "follow" ? "on-follow" : "";
+  $("idle").className = mode === "idle" ? "on-idle" : "";
+}
+
+function enableModeButtons(on) {
+  $("follow").disabled = !on;
+  $("idle").disabled = !on;
+}
+
+async function setMode(mode) {
+  if (!modeChar) return;
+  try {
+    await queueWrite(modeChar, mode);
+    showMode(mode);
+  } catch (err) {
+    showError("Mode change failed: " + err.message);
+  }
+}
+
 $("btn").onclick = () => (device && device.gatt.connected) ? disconnect() : connect();
+$("follow").onclick = () => setMode("follow");
+$("idle").onclick = () => setMode("idle");
 
 async function connect() {
   if (!navigator.bluetooth) {
@@ -95,9 +142,23 @@ async function connect() {
     locChar = await service.getCharacteristic(PHONE_LOC);
     const statusChar = await service.getCharacteristic(STATUS);
     statusChar.addEventListener("characteristicvaluechanged", e => {
-      $("cart").textContent = new TextDecoder().decode(e.target.value);
+      const text = new TextDecoder().decode(e.target.value);
+      $("cart").textContent = text;
+      if (text.startsWith("FOLLOW")) showMode("follow");
+      else if (text.startsWith("IDLE")) showMode("idle");
     });
     await statusChar.startNotifications();
+
+    // Older cart firmware has no mode setting; the page still works without it
+    try {
+      modeChar = await service.getCharacteristic(MODE);
+      const current = new TextDecoder().decode(await modeChar.readValue());
+      showMode(current.trim());
+      enableModeButtons(true);
+    } catch (_) {
+      modeChar = null;
+      $("mode").textContent = "Not supported by this cart firmware";
+    }
 
     $("ble").textContent = "Connected to " + device.name;
     $("btn").textContent = "Disconnect";
@@ -119,6 +180,10 @@ function onDisconnected() {
   $("btn").textContent = "Connect to cart";
   $("btn").className = "";
   locChar = null;
+  modeChar = null;
+  enableModeButtons(false);
+  showMode("idle");   // the cart drops to Idle on its own when the phone disconnects
+  $("mode").textContent = "Idle (disconnected)";
   if (watchId !== null) navigator.geolocation.clearWatch(watchId);
   watchId = null;
   clearInterval(sendTimer);
@@ -149,7 +214,7 @@ async function sendLatest() {
   sending = true;
   const msg = `${latest.latitude.toFixed(7)},${latest.longitude.toFixed(7)},${latest.accuracy.toFixed(1)}`;
   try {
-    await locChar.writeValue(new TextEncoder().encode(msg));
+    await queueWrite(locChar, msg);
     $("sent").textContent = ++sentCount;
   } catch (err) {
     showError("Send failed: " + err.message);
